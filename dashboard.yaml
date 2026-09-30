@@ -4,10 +4,29 @@ icon: mdi:food-drumstick
 path: curing-chamber
 title: Curing Chamber
 show_icon_and_title: false
+# Colour key used throughout: temperature = orange, humidity = blue,
+# green = target band, grey = fridge running / cut-off.
 sections:
+  # ========== Status ==========
   - type: grid
     column_span: 2
     cards:
+      - type: heading
+        heading: Curing Chamber
+        heading_style: title
+        icon: mdi:food-drumstick
+        badges:
+          - type: entity
+            entity: sensor.charcuterie_monitor_average_charcuterie_temperature
+            icon: mdi:thermometer-lines
+            show_state: true
+            show_icon: true
+          - type: entity
+            entity: sensor.charcuterie_monitor_average_charcuterie_humidity
+            icon: mdi:water-percent
+            show_state: true
+            show_icon: true
+
       # ---------- Headline: what the controller is doing, and whether it's still reporting ----------
       - type: markdown
         text_only: true
@@ -16,6 +35,7 @@ sections:
         content: |-
           {% set e = 'sensor.curing_chamber_status' %}
           {% set sw = 'switch.living_room_curing_chamber_sonoff_10018b4516' %}
+          {% set pw = 'sensor.living_room_curing_chamber_sonoff_10018b4516_power' %}
           {% macro cap(s) %}{{ s[:1] | upper ~ s[1:] if s else '' }}{% endmacro %}
           {% set status = states(e) %}
           {% set head = status.split(' · ')[0] | lower %}
@@ -23,7 +43,7 @@ sections:
           {% set age = ((now() - as_datetime(upd)).total_seconds() / 60) | round(0) | int if upd else 999 %}
           {% set t = state_attr(e, 'temp') %}
           {% set on = is_state(sw, 'on') %}
-          {% set title = status ~ ' · fridge ' ~ ('on' if on else 'off') %}
+          {% set title = status %}
           {% set body = cap(state_attr(e, 'decision')) %}
           {% if status in ['unavailable', 'unknown'] or age > 5 %}
             {% set kind = 'error' %}
@@ -34,122 +54,94 @@ sections:
           {% elif t is number and (t < state_attr(e, 'band_low') or t > state_attr(e, 'band_high')) %}{% set kind = 'warning' %}
           {% elif head in ['cooling', 'heating'] %}{% set kind = 'info' %}
           {% else %}{% set kind = 'success' %}{% endif %}
+          {% set mins = state_attr(e, 'minutes_in_state') %}
           <ha-alert alert-type="{{ kind }}" title="{{ title }}">{{ body }}</ha-alert>
 
-      # ---------- Gauges ----------
-      - type: custom:trend-gauge-card
-        entity: sensor.charcuterie_monitor_charcuterie_humidity
-        name: Curing Chamber Humidity
-        needle: true
-        needle_style: marker
-        segments:
-          - from: 0
-            color: var(--error-color)
-          - from: 60
-            color: var(--warning-color)
-          - from: 70
-            color: var(--success-color)
-          - from: 80
-            color: var(--warning-color)
-          - from: 90
-            color: var(--error-color)
-        trend:
-          window: 5m
-          threshold_mode: absolute
-          strong_threshold: 10
-          opacity: 0.25
-        grid_options:
-          columns: 12
-          rows: auto
-      - type: custom:trend-gauge-card
-        entity: sensor.charcuterie_monitor_charcuterie_temperature
-        name: Curing Chamber Temperature
-        max: 25
-        needle: true
-        needle_style: marker
-        segments:
-          - from: 0
-            color: var(--error-color)
-          - from: 7.5
-            color: var(--warning-color)
-          - from: 10
-            color: var(--success-color)
-          - from: 15
-            color: var(--warning-color)
-          - from: 20
-            color: var(--error-color)
-        trend:
-          window: 5m
-          threshold_mode: absolute
-          threshold: 0.1
-          strong_threshold: 2.5
-          opacity: 0.25
-        grid_options:
-          columns: 12
-          rows: auto
+          Fridge **{{ 'on' if on else 'off' }}**{{ (' for ' ~ (mins | round(0) | int) ~ ' min') if mins is number else '' }}{{ (' · ' ~ (states(pw) | float(0) | round(0) | int) ~ ' W') if on and is_number(states(pw)) else '' }} · {{ 'updated ' ~ (age if age < 999 else '?') ~ ' min ago' if upd else 'never updated' }}
 
-      # ---------- Last 3 hours ----------
+      # ---------- Live readings ----------
+      - type: tile
+        entity: sensor.charcuterie_monitor_charcuterie_temperature
+        name: Temperature
+        icon: mdi:thermometer
+        color: deep-orange
+        vertical: false
+        features_position: bottom
+        features:
+          - type: trend-graph
+            hours_to_show: 3
+        grid_options:
+          columns: 6
+      - type: tile
+        entity: sensor.charcuterie_monitor_charcuterie_humidity
+        name: Humidity
+        icon: mdi:water-percent
+        color: blue
+        vertical: false
+        features_position: bottom
+        features:
+          - type: trend-graph
+            hours_to_show: 3
+        grid_options:
+          columns: 6
+      - type: tile
+        entity: sensor.living_room_curing_chamber_sonoff_10018b4516_power
+        name: Compressor
+        icon: mdi:flash
+        color: blue-grey
+        vertical: false
+        features_position: bottom
+        features:
+          - type: trend-graph
+            hours_to_show: 3
+        grid_options:
+          columns: 6
+      - type: tile
+        entity: switch.living_room_curing_chamber_sonoff_10018b4516
+        name: Fridge
+        icon: mdi:fridge-outline
+        color: light-blue
+        vertical: false
+        state_content:
+          - state
+          - last_changed
+        # Tapping opens details instead of toggling, so the fridge can't be switched by accident
+        tap_action:
+          action: more-info
+        icon_tap_action:
+          action: more-info
+        grid_options:
+          columns: 6
+
+  # ========== History ==========
+  # Needs a Dropdown helper, input_select.curing_chamber_range, with the options
+  # "3 hours", "24 hours" and "30 days". Without it the 3-hour charts show.
+  - type: grid
+    column_span: 2
+    cards:
+      - type: heading
+        heading: History
+        heading_style: title
+      - type: tile
+        entity: input_select.curing_chamber_range
+        name: Time range
+        icon: mdi:calendar-range
+        hide_state: true
+        vertical: false
+        features_position: inline
+        features:
+          - type: select-options
+        grid_options:
+          columns: full
+
+      # ---------- 3 hours ----------
       - type: custom:apexcharts-card
-        header:
-          show: true
-          title: Humidity
-          show_states: true
-          colorize_states: true
-        graph_span: 3h
-        span:
-          end: minute
-        update_interval: 1min
-        apex_config:
-          chart:
-            height: 260
-          legend:
-            show: false
-          tooltip:
-            x:
-              format: HH:mm
-          annotations:
-            yaxis:
-              - "y": 70
-                y2: 80
-                fillColor: "#4caf50"
-                opacity: 0.08
-                borderColor: transparent
-        yaxis:
-          - id: rh
-            min: ~60
-            max: ~90
-            decimals: 0
-          - id: fridge
-            min: 0
-            max: 1
-            show: false
-        series:
-          - entity: switch.living_room_curing_chamber_sonoff_10018b4516
-            name: Fridge
-            yaxis_id: fridge
-            transform: "return x === 'on' ? 1 : 0;"
-            type: area
-            curve: stepline
-            color: "#4fc3f7"
-            opacity: 0.15
-            stroke_width: 0
-            show:
-              in_header: false
-              legend_value: false
-          - entity: sensor.charcuterie_monitor_charcuterie_humidity
-            name: Current
-            unit: "%"
-            yaxis_id: rh
-            color: "#90caf9"
-            stroke_width: 1
-            opacity: 0.6
-          - entity: sensor.charcuterie_monitor_average_charcuterie_humidity
-            name: 1h Avg
-            unit: "%"
-            yaxis_id: rh
-            color: "#2196f3"
-            stroke_width: 2.5
-      - type: custom:apexcharts-card
+        visibility:
+          - condition: state
+            entity: input_select.curing_chamber_range
+            state_not:
+              - 24 hours
+              - 30 days
         header:
           show: true
           title: Temperature
@@ -161,7 +153,7 @@ sections:
         update_interval: 1min
         apex_config:
           chart:
-            height: 260
+            height: 220
           legend:
             show: false
           tooltip:
@@ -183,8 +175,8 @@ sections:
             transform: "return x === 'on' ? 1 : 0;"
             type: area
             curve: stepline
-            color: "#4fc3f7"
-            opacity: 0.15
+            color: "#9e9e9e"
+            opacity: 0.12
             stroke_width: 0
             show:
               in_header: false
@@ -219,39 +211,47 @@ sections:
             unit: °C
             yaxis_id: temp
             curve: stepline
-            color: "#4fc3f7"
+            color: "#9e9e9e"
             stroke_width: 1
             stroke_dash: 2
             show:
               in_header: false
           - entity: sensor.charcuterie_monitor_charcuterie_temperature
-            name: Current
+            name: Now
             unit: °C
             yaxis_id: temp
-            color: "#F8C5B1"
+            color: "#e0875a"
             stroke_width: 1
+            opacity: 0.5
           # Needs the blueprint's "Smoothed temperature (1h mean)" input to be set
           - entity: sensor.curing_chamber_status
             attribute: temp_1h
-            name: 1h Avg
+            name: 1h avg
             unit: °C
             yaxis_id: temp
-            color: "#ef6c3b"
+            color: "#e0875a"
             stroke_width: 2.5
-
-      # ---------- Last 24 hours ----------
+        grid_options:
+          columns: full
       - type: custom:apexcharts-card
+        visibility:
+          - condition: state
+            entity: input_select.curing_chamber_range
+            state_not:
+              - 24 hours
+              - 30 days
         header:
           show: true
-          title: Humidity (24h)
-          show_states: false
-        graph_span: 24h
+          title: Humidity
+          show_states: true
+          colorize_states: true
+        graph_span: 3h
         span:
           end: minute
-        update_interval: 5min
+        update_interval: 1min
         apex_config:
           chart:
-            height: 260
+            height: 220
           legend:
             show: false
           tooltip:
@@ -265,25 +265,52 @@ sections:
                 opacity: 0.08
                 borderColor: transparent
         yaxis:
-          - min: ~50
-            max: 100
+          - id: rh
+            min: ~60
+            max: ~90
             decimals: 0
+          - id: fridge
+            min: 0
+            max: 1
+            show: false
         series:
+          - entity: switch.living_room_curing_chamber_sonoff_10018b4516
+            name: Fridge
+            yaxis_id: fridge
+            transform: "return x === 'on' ? 1 : 0;"
+            type: area
+            curve: stepline
+            color: "#9e9e9e"
+            opacity: 0.12
+            stroke_width: 0
+            show:
+              in_header: false
+              legend_value: false
           - entity: sensor.charcuterie_monitor_charcuterie_humidity
-            name: RH live
+            name: Now
             unit: "%"
-            color: "#90caf9"
+            yaxis_id: rh
+            color: "#5b9be6"
             stroke_width: 1
-            opacity: 0.6
+            opacity: 0.5
           - entity: sensor.charcuterie_monitor_average_charcuterie_humidity
-            name: RH 1h
+            name: 1h avg
             unit: "%"
-            color: "#2196f3"
+            yaxis_id: rh
+            color: "#5b9be6"
             stroke_width: 2.5
+        grid_options:
+          columns: full
+
+      # ---------- 24 hours ----------
       - type: custom:apexcharts-card
+        visibility:
+          - condition: state
+            entity: input_select.curing_chamber_range
+            state: 24 hours
         header:
           show: true
-          title: Temperature (24h)
+          title: Temperature
           show_states: false
         graph_span: 24h
         span:
@@ -291,7 +318,7 @@ sections:
         update_interval: 5min
         apex_config:
           chart:
-            height: 260
+            height: 220
           legend:
             show: false
           tooltip:
@@ -306,26 +333,234 @@ sections:
                 opacity: 0.08
                 borderColor: transparent
         yaxis:
+          - id: temp
+            min: ~10
+            max: ~16
+            decimals: 1
+          - id: fridge
+            min: 0
+            max: 1
+            show: false
+        series:
+          - entity: switch.living_room_curing_chamber_sonoff_10018b4516
+            name: Fridge
+            yaxis_id: fridge
+            transform: "return x === 'on' ? 1 : 0;"
+            type: area
+            curve: stepline
+            color: "#9e9e9e"
+            opacity: 0.12
+            stroke_width: 0
+          - entity: sensor.charcuterie_monitor_charcuterie_temperature
+            name: Reading
+            unit: °C
+            yaxis_id: temp
+            color: "#e0875a"
+            stroke_width: 1
+            opacity: 0.5
+          - entity: sensor.charcuterie_monitor_average_charcuterie_temperature
+            name: Average
+            unit: °C
+            yaxis_id: temp
+            color: "#e0875a"
+            stroke_width: 2.5
+        grid_options:
+          columns: full
+      - type: custom:apexcharts-card
+        visibility:
+          - condition: state
+            entity: input_select.curing_chamber_range
+            state: 24 hours
+        header:
+          show: true
+          title: Humidity
+          show_states: false
+        graph_span: 24h
+        span:
+          end: minute
+        update_interval: 5min
+        apex_config:
+          chart:
+            height: 220
+          legend:
+            show: false
+          tooltip:
+            x:
+              format: HH:mm
+          annotations:
+            yaxis:
+              - "y": 70
+                y2: 80
+                fillColor: "#4caf50"
+                opacity: 0.08
+                borderColor: transparent
+        yaxis:
+          - id: rh
+            min: ~50
+            max: 100
+            decimals: 0
+          - id: fridge
+            min: 0
+            max: 1
+            show: false
+        series:
+          - entity: switch.living_room_curing_chamber_sonoff_10018b4516
+            name: Fridge
+            yaxis_id: fridge
+            transform: "return x === 'on' ? 1 : 0;"
+            type: area
+            curve: stepline
+            color: "#9e9e9e"
+            opacity: 0.12
+            stroke_width: 0
+          - entity: sensor.charcuterie_monitor_charcuterie_humidity
+            name: Reading
+            unit: "%"
+            yaxis_id: rh
+            color: "#5b9be6"
+            stroke_width: 1
+            opacity: 0.5
+          - entity: sensor.charcuterie_monitor_average_charcuterie_humidity
+            name: 1h avg
+            unit: "%"
+            yaxis_id: rh
+            color: "#5b9be6"
+            stroke_width: 2.5
+        grid_options:
+          columns: full
+
+      # ---------- 30 days (daily long-term statistics) ----------
+      - type: custom:apexcharts-card
+        visibility:
+          - condition: state
+            entity: input_select.curing_chamber_range
+            state: 30 days
+        header:
+          show: true
+          title: Temperature · daily
+          show_states: false
+        graph_span: 30d
+        span:
+          end: day
+        apex_config:
+          chart:
+            height: 220
+          legend:
+            show: false
+          tooltip:
+            x:
+              format: dd MMM
+          annotations:
+            yaxis:
+              - "y": 12
+                y2: 14
+                fillColor: "#4caf50"
+                opacity: 0.08
+                borderColor: transparent
+        yaxis:
           - min: ~10
             max: ~16
             decimals: 1
         series:
           - entity: sensor.charcuterie_monitor_charcuterie_temperature
-            name: Temp
+            name: Max
             unit: °C
-            color: "#F8C5B1"
+            color: "#e0875a"
             stroke_width: 1
-          - entity: sensor.charcuterie_monitor_average_charcuterie_temperature
-            name: Average
+            opacity: 0.4
+            statistics:
+              type: max
+              period: day
+          - entity: sensor.charcuterie_monitor_charcuterie_temperature
+            name: Min
             unit: °C
-            color: "#ef6c3b"
+            color: "#e0875a"
+            stroke_width: 1
+            opacity: 0.4
+            statistics:
+              type: min
+              period: day
+          - entity: sensor.charcuterie_monitor_charcuterie_temperature
+            name: Mean
+            unit: °C
+            color: "#e0875a"
             stroke_width: 2.5
+            statistics:
+              type: mean
+              period: day
+        grid_options:
+          columns: full
+      - type: custom:apexcharts-card
+        visibility:
+          - condition: state
+            entity: input_select.curing_chamber_range
+            state: 30 days
+        header:
+          show: true
+          title: Humidity · daily
+          show_states: false
+        graph_span: 30d
+        span:
+          end: day
+        apex_config:
+          chart:
+            height: 220
+          legend:
+            show: false
+          tooltip:
+            x:
+              format: dd MMM
+          annotations:
+            yaxis:
+              - "y": 70
+                y2: 80
+                fillColor: "#4caf50"
+                opacity: 0.08
+                borderColor: transparent
+        yaxis:
+          - min: ~50
+            max: 100
+            decimals: 0
+        series:
+          - entity: sensor.charcuterie_monitor_charcuterie_humidity
+            name: Max
+            unit: "%"
+            color: "#5b9be6"
+            stroke_width: 1
+            opacity: 0.4
+            statistics:
+              type: max
+              period: day
+          - entity: sensor.charcuterie_monitor_charcuterie_humidity
+            name: Min
+            unit: "%"
+            color: "#5b9be6"
+            stroke_width: 1
+            opacity: 0.4
+            statistics:
+              type: min
+              period: day
+          - entity: sensor.charcuterie_monitor_charcuterie_humidity
+            name: Mean
+            unit: "%"
+            color: "#5b9be6"
+            stroke_width: 2.5
+            statistics:
+              type: mean
+              period: day
+        grid_options:
+          columns: full
 
-      # ---------- Power ----------
+  # ========== Compressor ==========
+  - type: grid
+    column_span: 2
+    cards:
+      - type: heading
+        heading: Compressor
+        heading_style: title
       - type: custom:apexcharts-card
         header:
           show: true
-          title: Compressor load
           show_states: true
           colorize_states: true
         graph_span: 1.5h
@@ -355,7 +590,7 @@ sections:
             name: Current
             unit: A
             yaxis_id: amps
-            color: "#1e88e5"
+            color: "#78909c"
             type: area
             curve: stepline
             opacity: 0.3
@@ -365,7 +600,7 @@ sections:
             name: Power
             unit: W
             yaxis_id: amps
-            color: "#43a047"
+            color: "#78909c"
             float_precision: 0
             show:
               in_chart: false
@@ -373,7 +608,7 @@ sections:
             name: Supply
             unit: V
             yaxis_id: volts
-            color: "#ffb300"
+            color: "#bdbdbd"
             stroke_width: 1
             opacity: 0.6
             group_by:
@@ -382,35 +617,12 @@ sections:
         grid_options:
           columns: full
 
-      # ---------- Long term ----------
-      - type: statistics-graph
-        entities:
-          - sensor.charcuterie_monitor_charcuterie_humidity
-        title: Humidity (30D)
-        days_to_show: 30
-        period: day
-        chart_type: line
-        stat_types:
-          - mean
-          - min
-          - max
-        hide_legend: true
-        fit_y_data: true
-      - type: statistics-graph
-        entities:
-          - sensor.charcuterie_monitor_charcuterie_temperature
-        title: Temperature (30D)
-        days_to_show: 30
-        period: day
-        chart_type: line
-        stat_types:
-          - mean
-          - min
-          - max
-        hide_legend: true
-        fit_y_data: true
-
-      # ---------- Controller reasoning ----------
+  # ========== Controller reasoning ==========
+  - type: grid
+    cards:
+      - type: heading
+        heading: Why it is doing this
+        heading_style: title
       - type: markdown
         grid_options:
           columns: full
@@ -418,67 +630,106 @@ sections:
           {% set e = 'sensor.curing_chamber_status' %}
           {% macro cap(s) %}{% set s = s | string if s is not none else '' %}{{ s[:1] | upper ~ s[1:] if s else '—' }}{% endmacro %}
           {% set rows = [
-            ('mdi:thermometer', 'Temperature', 'temperature'),
-            ('mdi:thermometer-lines', '1h temperature', 'temp_trend'),
-            ('mdi:water-percent', 'Humidity', 'humidity'),
-            ('mdi:power-socket', 'Power', 'power'),
-            ('mdi:sine-wave', 'Supply', 'supply'),
-            ('mdi:chart-timeline-variant', 'Learned cycle', 'cycle'),
-            ('mdi:calendar-clock', '24h averages', 'averages'),
+            ('Temperature', 'temperature'),
+            ('1h trend', 'temp_trend'),
+            ('Humidity', 'humidity'),
+            ('Power', 'power'),
+            ('Supply', 'supply'),
+            ('Learned cycle', 'cycle'),
+            ('24h averages', 'averages'),
           ] %}
-          {% for icon, label, key in rows if state_attr(e, key) %}
-          <ha-icon icon="{{ icon }}"></ha-icon> **{{ label }}**: {{ cap(state_attr(e, key)) }}
-
+          <table>
+          {% for label, key in rows if state_attr(e, key) %}
+          <tr><td valign="top"><b>{{ label }}</b></td><td>{{ cap(state_attr(e, key)) }}</td></tr>
           {% endfor %}
+          </table>
 
-      # ---------- Learned on/off schedule (used by the failsafe) ----------
+  # ========== Learned on/off schedule (used by the failsafe) ==========
+  - type: grid
+    cards:
+      - type: heading
+        heading: Learned cycle
+        heading_style: title
+      # Duty per 3-hour slot. Faded bars are slots with fewer than 3 clean cycles.
+      - type: custom:apexcharts-card
+        graph_span: 24h
+        span:
+          start: day
+        update_interval: 5min
+        now:
+          show: true
+          label: Now
+        header:
+          show: false
+        apex_config:
+          chart:
+            height: 200
+          legend:
+            show: false
+          plotOptions:
+            bar:
+              columnWidth: 70%
+              borderRadius: 3
+          tooltip:
+            x:
+              format: HH:mm
+          xaxis:
+            labels:
+              format: HH:mm
+        yaxis:
+          - min: 0
+            max: ~50
+            decimals: 0
+        series:
+          - entity: sensor.curing_chamber_status
+            name: Duty
+            type: column
+            unit: "%"
+            color: "#78909c"
+            data_generator: |
+              const p = entity.attributes.learned_profile;
+              if (!p) return [];
+              const d = new Date(start); d.setHours(0, 0, 0, 0);
+              return p.on.map((on, i) => {
+                const off = p.off[i];
+                const ready = p.on_samples[i] >= 3 && p.off_samples[i] >= 3;
+                const duty = ready && on + off > 0 ? Math.round(100 * on / (on + off)) : null;
+                return [d.getTime() + (i * 3 + 1.5) * 3600000, duty];
+              });
+          - entity: sensor.curing_chamber_status
+            name: Learning
+            type: column
+            unit: "%"
+            color: "#78909c"
+            opacity: 0.35
+            data_generator: |
+              const p = entity.attributes.learned_profile;
+              if (!p) return [];
+              const d = new Date(start); d.setHours(0, 0, 0, 0);
+              return p.on.map((on, i) => {
+                const off = p.off[i];
+                const ready = p.on_samples[i] >= 3 && p.off_samples[i] >= 3;
+                const seen = p.on_samples[i] > 0 && p.off_samples[i] > 0;
+                const duty = !ready && seen && on + off > 0 ? Math.round(100 * on / (on + off)) : null;
+                return [d.getTime() + (i * 3 + 1.5) * 3600000, duty];
+              });
+        grid_options:
+          columns: full
       - type: markdown
-        title: Learned cycle
         grid_options:
           columns: full
         content: |-
           {% set p = state_attr('sensor.curing_chamber_status', 'learned_profile') %}
           {% if p %}
-          | Time | On | Off | Duty | Cycles |
+          | Slot | On | Off | Duty | Cycles |
           |:--|--:|--:|--:|--:|
           {% for i in range(8) -%}
           {%- set n_on, n_off = p.on_samples[i], p.off_samples[i] -%}
           {%- set ready = n_on >= 3 and n_off >= 3 -%}
-          | {{ '%02d:00' | format(i * 3) }}{{ ' ◀' if i == now().hour // 3 else '' }} | {{ (p.on[i] | round(0) | int ~ 'm') if n_on else '—' }} | {{ (p.off[i] | round(0) | int ~ 'm') if n_off else '—' }} | {{ ((100 * p.on[i] / (p.on[i] + p.off[i])) | round(0) | int ~ '%') if ready else 'learning' }} | {{ n_on }}/{{ n_off }} |
+          {%- set cur = i == now().hour // 3 -%}
+          | {{ '**' if cur else '' }}{{ '%02d:00' | format(i * 3) }}{{ ' · now**' if cur else '' }} | {{ (p.on[i] | round(0) | int ~ ' m') if n_on else '—' }} | {{ (p.off[i] | round(0) | int ~ ' m') if n_off else '—' }} | {{ ((100 * p.on[i] / (p.on[i] + p.off[i])) | round(0) | int ~ ' %') if ready else 'learning' }} | {{ n_on }}/{{ n_off }} |
           {% endfor %}
           {% else %}
           Nothing learned yet. Set a memory helper in the blueprint.
           {% endif %}
-badges:
-  - type: entity
-    show_name: false
-    show_state: true
-    show_icon: true
-    entity: sensor.charcuterie_monitor_average_charcuterie_humidity
-    icon: m3o:humidity-percentage
-  - type: entity
-    show_name: false
-    show_state: true
-    show_icon: true
-    entity: sensor.charcuterie_monitor_average_charcuterie_temperature
-    icon: mdi:thermometer-lines
-header: {}
-background:
-  opacity: 100
-  alignment: center
-  size: cover
-  repeat: no-repeat
-  attachment: fixed
-  image:
-    media_content_id: media-source://image/image.curing_chamber_background
-    media_content_type: image/svg+xml
-    metadata:
-      title: Curing Chamber Background
-      thumbnail: /api/image_proxy/image.curing_chamber_background
-      media_class: video
-      children_media_class: null
-      navigateIds:
-        - {}
-        - media_content_type: app
-          media_content_id: media-source://image
 cards: []
