@@ -1,0 +1,765 @@
+blueprint:
+  name: Curing Chamber Controller
+  description: >
+    Controls a charcuterie curing chamber by switching its power (fridge/compressor
+    or heater) on and off. It holds the target temperature with a deadband
+    and protects the compressor from short-cycling. Where it can, it also steers
+    humidity by nudging the temperature setpoint within a range you set:
+    in cooling mode, running the compressor longer pulls moisture out of the air,
+    and running it less leaves more in. Uses current draw to catch compressor
+    faults and stuck relays, and voltage to catch brownouts. Sends alerts, plus
+    an optional daily summary built from the 24-hour averages.
+
+    Optionally publishes a full status sensor (with a plain-English explanation of
+    every decision) over MQTT discovery.
+
+    SETUP NOTE: Set the fridge's own thermostat to its coldest setting so
+    Home Assistant is the only thing deciding when it runs.
+  domain: automation
+  author: Zach
+  homeassistant:
+    min_version: 2024.10.0
+  input:
+    sensors:
+      name: Sensors
+      icon: mdi:thermometer
+      input:
+        temp_sensor:
+          name: Live temperature
+          selector:
+            entity:
+              filter:
+                domain: sensor
+                device_class: temperature
+        humidity_sensor:
+          name: Live humidity
+          selector:
+            entity:
+              filter:
+                domain: sensor
+                device_class: humidity
+        smoothed_humidity_sensor:
+          name: Smoothed humidity (1h mean)
+          description: >
+            Used for humidity assist and humidity alarms. Live RH swings with
+            every compressor cycle, so the assist needs a smoothed value. Create a
+            Statistics helper (mean, max age 1 hour) on the live humidity sensor.
+          selector:
+            entity:
+              filter:
+                domain: sensor
+        avg_temp_sensor:
+          name: 24h average temperature
+          selector:
+            entity:
+              filter:
+                domain: sensor
+        avg_humidity_sensor:
+          name: 24h average humidity
+          selector:
+            entity:
+              filter:
+                domain: sensor
+    power:
+      name: Chamber power (Sonoff)
+      icon: mdi:power-plug
+      input:
+        power_switch:
+          name: Chamber power switch
+          selector:
+            entity:
+              filter:
+                domain: switch
+        current_sensor:
+          name: Current sensor (A)
+          selector:
+            entity:
+              filter:
+                domain: sensor
+                device_class: current
+        voltage_sensor:
+          name: Voltage sensor (V)
+          selector:
+            entity:
+              filter:
+                domain: sensor
+                device_class: voltage
+        chamber_type:
+          name: What does the switched power drive?
+          default: cooling
+          selector:
+            select:
+              options:
+                - label: Cooling (fridge / freezer compressor)
+                  value: cooling
+                - label: Heating (heat mat / heater)
+                  value: heating
+    targets:
+      name: Targets
+      icon: mdi:target
+      input:
+        target_temp:
+          name: Target temperature
+          default: 13
+          selector:
+            number:
+              min: 0
+              max: 30
+              step: 0.5
+              unit_of_measurement: "°C"
+        temp_band:
+          name: Temperature deadband (±)
+          description: Power switches on or off when the temperature drifts this far from the target. Wider bands mean fewer, longer cycles.
+          default: 1
+          selector:
+            number:
+              min: 0.2
+              max: 3
+              step: 0.1
+              unit_of_measurement: "°C"
+        target_humidity:
+          name: Target humidity
+          default: 75
+          selector:
+            number:
+              min: 40
+              max: 95
+              step: 1
+              unit_of_measurement: "%"
+        humidity_band:
+          name: Humidity tolerance (±)
+          description: Humidity assist starts only once RH is outside target ± this value.
+          default: 5
+          selector:
+            number:
+              min: 1
+              max: 15
+              step: 1
+              unit_of_measurement: "%"
+    humidity_assist:
+      name: Humidity assist
+      icon: mdi:water-percent
+      input:
+        humidity_assist_enabled:
+          name: Use temperature to help steer humidity
+          default: true
+          selector:
+            boolean:
+        humidity_assist_offset:
+          name: Max setpoint shift for humidity
+          description: >
+            How far the controller may move the temperature setpoint to help
+            humidity. Example: with a 13 °C target and 0.5 °C here, it holds
+            around 12.5 °C when too humid and 13.5 °C when too dry.
+          default: 0.5
+          selector:
+            number:
+              min: 0
+              max: 2
+              step: 0.1
+              unit_of_measurement: "°C"
+    protection:
+      name: Equipment protection & failsafe
+      icon: mdi:shield-check
+      collapsed: true
+      input:
+        min_off_minutes:
+          name: Minimum off time
+          description: Protects the compressor from short-cycling.
+          default: 5
+          selector:
+            number:
+              min: 0
+              max: 30
+              unit_of_measurement: min
+        overshoot_comp:
+          name: Overshoot compensation
+          description: >
+            The temperature keeps moving after power is cut, because the coil is
+            still cold or the heater is still warm. This cuts power early by this
+            amount so the chamber coasts to the band edge instead of past it.
+            Example: band 11.5–14.5 °C with 0.5 here means cooling stops at 12.0 °C.
+            It never cuts off past the setpoint.
+          default: 0.5
+          selector:
+            number:
+              min: 0
+              max: 3
+              step: 0.1
+              unit_of_measurement: "°C"
+        min_on_minutes:
+          name: Minimum on time
+          default: 2
+          selector:
+            number:
+              min: 0
+              max: 30
+              unit_of_measurement: min
+        running_amps:
+          name: Running current threshold
+          description: Current above this means the load is running.
+          default: 0.3
+          selector:
+            number:
+              min: 0.05
+              max: 5
+              step: 0.05
+              unit_of_measurement: A
+        fault_minutes:
+          name: No-current fault delay
+          description: Alert if the switch is on but no current flows for this long.
+          default: 5
+          selector:
+            number:
+              min: 1
+              max: 30
+              unit_of_measurement: min
+        max_run_minutes:
+          name: Continuous run alert
+          description: Alert if power stays on this long (door open, failing compressor, room too hot).
+          default: 90
+          selector:
+            number:
+              min: 15
+              max: 480
+              unit_of_measurement: min
+        min_voltage:
+          name: Low voltage alert
+          default: 105
+          selector:
+            number:
+              min: 80
+              max: 240
+              unit_of_measurement: V
+        failsafe:
+          name: If the temperature sensor goes unavailable
+          default: leave
+          selector:
+            select:
+              options:
+                - label: Leave power as it is
+                  value: leave
+                - label: Turn power off
+                  value: "off"
+                - label: Turn power on
+                  value: "on"
+    alerts:
+      name: Notifications
+      icon: mdi:bell
+      input:
+        notify_device:
+          name: Notification device
+          selector:
+            device:
+              filter:
+                integration: mobile_app
+        temp_alarm_offset:
+          name: Temperature alarm (± from target)
+          default: 3
+          selector:
+            number:
+              min: 1
+              max: 10
+              step: 0.5
+              unit_of_measurement: "°C"
+        temp_alarm_minutes:
+          name: Temperature alarm delay
+          default: 15
+          selector:
+            number:
+              min: 1
+              max: 120
+              unit_of_measurement: min
+        humidity_alarm_offset:
+          name: Humidity alarm (± from target)
+          default: 10
+          selector:
+            number:
+              min: 3
+              max: 30
+              unit_of_measurement: "%"
+        humidity_alarm_minutes:
+          name: Humidity alarm delay
+          default: 30
+          selector:
+            number:
+              min: 5
+              max: 360
+              unit_of_measurement: min
+        daily_summary:
+          name: Send daily summary
+          default: true
+          selector:
+            boolean:
+        summary_time:
+          name: Daily summary time
+          default: "08:00:00"
+          selector:
+            time:
+
+    dashboard:
+      name: Dashboard status
+      icon: mdi:monitor-dashboard
+      input:
+        status_helper:
+          name: Status text helper (optional)
+          description: >
+            An input_text helper that shows what the controller is doing, such as
+            "Cooling", "Idle · drying", "Waiting · compressor rest 3m left",
+            "Fault · no current draw". Add it to a dashboard as an entity or tile card.
+          default: ""
+          selector:
+            entity:
+              filter:
+                domain: input_text
+        detail_helper:
+          name: Detail text helper (optional)
+          description: >
+            An input_text helper for a one-line readout, e.g.
+            "12.8°C · 78% RH (1h) · setpoint 12.5 ±1°C · 0.9 A".
+          default: ""
+          selector:
+            entity:
+              filter:
+                domain: input_text
+
+        mqtt_enabled:
+          name: Publish status sensor over MQTT
+          description: >
+            Creates a "Status" sensor through MQTT discovery. Its state is the
+            status text; its attributes hold the full explanation, each part of it
+            (temperature, humidity, decision, power, supply, averages), and the
+            raw values. Requires the MQTT integration.
+          default: false
+          selector:
+            boolean:
+        mqtt_base:
+          name: MQTT topic / device name
+          description: Used for the topic, unique ID and device name. Change it if you run more than one chamber.
+          default: curing_chamber
+          selector:
+            text:
+
+mode: queued
+max: 10
+max_exceeded: silent
+
+trigger_variables:
+  tv_temp: !input temp_sensor
+  tv_hum: !input smoothed_humidity_sensor
+  tv_switch: !input power_switch
+  tv_current: !input current_sensor
+  tv_voltage: !input voltage_sensor
+  tv_target_t: !input target_temp
+  tv_target_h: !input target_humidity
+  tv_alarm_t: !input temp_alarm_offset
+  tv_alarm_h: !input humidity_alarm_offset
+  tv_amps: !input running_amps
+  tv_min_v: !input min_voltage
+
+triggers:
+  # --- Control loop ---
+  - trigger: state
+    entity_id: !input temp_sensor
+    id: control
+  - trigger: state
+    entity_id: !input smoothed_humidity_sensor
+    id: control
+  - trigger: time_pattern
+    minutes: "/1"
+    id: control
+  - trigger: homeassistant
+    event: start
+    id: control
+
+  # --- Alerts ---
+  - trigger: template
+    id: temp_high
+    value_template: "{% set t = states(tv_temp) %}{{ is_number(t) and t | float > tv_target_t + tv_alarm_t }}"
+    for:
+      minutes: !input temp_alarm_minutes
+  - trigger: template
+    id: temp_low
+    value_template: "{% set t = states(tv_temp) %}{{ is_number(t) and t | float < tv_target_t - tv_alarm_t }}"
+    for:
+      minutes: !input temp_alarm_minutes
+  - trigger: template
+    id: hum_high
+    value_template: "{% set h = states(tv_hum) %}{{ is_number(h) and h | float > tv_target_h + tv_alarm_h }}"
+    for:
+      minutes: !input humidity_alarm_minutes
+  - trigger: template
+    id: hum_low
+    value_template: "{% set h = states(tv_hum) %}{{ is_number(h) and h | float < tv_target_h - tv_alarm_h }}"
+    for:
+      minutes: !input humidity_alarm_minutes
+  - trigger: template
+    id: no_current
+    value_template: "{% set a = states(tv_current) %}{{ is_state(tv_switch, 'on') and is_number(a) and a | float < tv_amps }}"
+    for:
+      minutes: !input fault_minutes
+  - trigger: template
+    id: stuck_relay
+    value_template: "{% set a = states(tv_current) %}{{ is_state(tv_switch, 'off') and is_number(a) and a | float > tv_amps }}"
+    for:
+      minutes: 2
+  - trigger: template
+    id: low_voltage
+    value_template: "{% set v = states(tv_voltage) %}{{ is_number(v) and v | float > 0 and v | float < tv_min_v }}"
+    for:
+      minutes: 2
+  - trigger: state
+    id: long_run
+    entity_id: !input power_switch
+    to: "on"
+    for:
+      minutes: !input max_run_minutes
+  - trigger: state
+    id: sensor_lost
+    entity_id: !input temp_sensor
+    to:
+      - unavailable
+      - unknown
+    for:
+      minutes: 10
+  - trigger: time
+    id: summary
+    at: !input summary_time
+
+variables:
+  temp_sensor: !input temp_sensor
+  humidity_sensor: !input humidity_sensor
+  smoothed_humidity_sensor: !input smoothed_humidity_sensor
+  avg_temp_sensor: !input avg_temp_sensor
+  avg_humidity_sensor: !input avg_humidity_sensor
+  power_switch: !input power_switch
+  current_sensor: !input current_sensor
+  voltage_sensor: !input voltage_sensor
+  chamber_type: !input chamber_type
+  target_t: !input target_temp
+  band: !input temp_band
+  target_h: !input target_humidity
+  hum_band: !input humidity_band
+  humidity_assist: !input humidity_assist_enabled
+  assist: !input humidity_assist_offset
+  min_off: !input min_off_minutes
+  min_on: !input min_on_minutes
+  overshoot: !input overshoot_comp
+  failsafe: !input failsafe
+  daily_summary: !input daily_summary
+  fault_min: !input fault_minutes
+  run_amps: !input running_amps
+  status_helper: !input status_helper
+  mqtt_enabled: !input mqtt_enabled
+  mqtt_base: !input mqtt_base
+  detail_helper: !input detail_helper
+  min_v: !input min_voltage
+
+actions:
+  - choose:
+      # ================= CONTROL LOOP =================
+      - conditions: "{{ trigger.id == 'control' }}"
+        sequence:
+          - variables:
+              t: "{{ states(temp_sensor) | float(none) }}"
+              rh: "{{ states(smoothed_humidity_sensor) | float(none) }}"
+              amps: "{{ states(current_sensor) | float(none) }}"
+              sw_ok: "{{ states(power_switch) in ['on', 'off'] }}"
+              is_on: "{{ is_state(power_switch, 'on') }}"
+              mins_since: "{{ ((now() - states[power_switch].last_changed).total_seconds() / 60) if states[power_switch] is not none else 999 }}"
+              hum_state: "{% if rh is none %}ok{% elif rh > target_h + hum_band %}high{% elif rh < target_h - hum_band %}low{% else %}ok{% endif %}"
+              # Cooling: humid -> run colder (condense more); dry -> run warmer (less drying).
+              # Heating: humid -> run warmer (lowers RH); dry -> run cooler.
+              shift: "{% if not humidity_assist or hum_state == 'ok' %}0{% elif (chamber_type == 'cooling') == (hum_state == 'high') %}{{ -assist }}{% else %}{{ assist }}{% endif %}"
+              eff_target: "{{ target_t + (shift | float(0)) }}"
+              upper: "{{ eff_target + band }}"
+              lower: "{{ eff_target - band }}"
+              # Early cut-off to allow for coast-down after power is removed
+              cut_off: "{{ [lower + overshoot, eff_target] | min if chamber_type == 'cooling' else [upper - overshoot, eff_target] | max }}"
+              want: >-
+                {%- if t is none -%}failsafe
+                {%- elif chamber_type == 'cooling' -%}
+                  {%- if not is_on and t >= upper -%}on{%- elif is_on and t <= cut_off -%}off{%- else -%}none{%- endif -%}
+                {%- else -%}
+                  {%- if not is_on and t <= lower -%}on{%- elif is_on and t >= cut_off -%}off{%- else -%}none{%- endif -%}
+                {%- endif -%}
+              can_on: "{{ mins_since >= min_off }}"
+              can_off: "{{ mins_since >= min_on }}"
+          - choose:
+              # Temperature sensor missing -> failsafe
+              - conditions: "{{ want == 'failsafe' and failsafe == 'off' and is_on }}"
+                sequence:
+                  - action: switch.turn_off
+                    target:
+                      entity_id: "{{ power_switch }}"
+                    continue_on_error: true
+              - conditions: "{{ want == 'failsafe' and failsafe == 'on' and not is_on }}"
+                sequence:
+                  - action: switch.turn_on
+                    target:
+                      entity_id: "{{ power_switch }}"
+                    continue_on_error: true
+              # Normal thermostat control
+              - conditions: "{{ want == 'on' and can_on }}"
+                sequence:
+                  - action: switch.turn_on
+                    target:
+                      entity_id: "{{ power_switch }}"
+                    continue_on_error: true
+              - conditions: "{{ want == 'off' and can_off }}"
+                sequence:
+                  - action: switch.turn_off
+                    target:
+                      entity_id: "{{ power_switch }}"
+                    continue_on_error: true
+
+          # ----- Dashboard status -----
+          - variables:
+              now_on: >-
+                {%- if want == 'failsafe' -%}{{ failsafe == 'on' or (failsafe == 'leave' and is_on) }}
+                {%- elif want == 'on' -%}{{ can_on }}
+                {%- elif want == 'off' -%}{{ not can_off }}
+                {%- else -%}{{ is_on }}{%- endif -%}
+              verb: "{{ 'Cooling' if chamber_type == 'cooling' else 'Heating' }}"
+              hum_note: "{% if (shift | float(0)) != 0 %}{{ ' · drying' if hum_state == 'high' else ' · retaining moisture' }}{% endif %}"
+              status: >-
+                {%- if not sw_ok -%}Offline · switch unavailable
+                {%- elif want == 'failsafe' -%}Failsafe · temp sensor offline
+                {%- elif now_on -%}
+                  {%- if is_on and mins_since >= fault_min and amps is not none and amps < run_amps -%}Fault · no current draw
+                  {%- elif want == 'off' -%}{{ verb }} · min run {{ (min_on - mins_since) | round(0, 'ceil') | int }}m left
+                  {%- else -%}{{ verb }}{{ hum_note }}{%- endif -%}
+                {%- elif want == 'on' -%}Waiting · compressor rest {{ (min_off - mins_since) | round(0, 'ceil') | int }}m left
+                {%- elif chamber_type == 'cooling' and t < lower -%}Idle · warming to {{ lower | round(1) }}°C
+                {%- elif chamber_type == 'heating' and t > upper -%}Idle · cooling to {{ upper | round(1) }}°C
+                {%- else -%}Idle{{ hum_note }}{%- endif -%}
+              detail: >-
+                {{ t if t is not none else '—' }}°C · {{ rh | round(0) | int if rh is not none else '—' }}% RH (1h)
+                · setpoint {{ eff_target | round(1) }} ±{{ band }}°C · {{ amps if amps is not none else '—' }} A
+          - if:
+              - "{{ status_helper != '' and states(status_helper) != status }}"
+            then:
+              - action: input_text.set_value
+                target:
+                  entity_id: "{{ status_helper }}"
+                data:
+                  value: "{{ status[:100] }}"
+          - if:
+              - "{{ detail_helper != '' and states(detail_helper) != detail }}"
+            then:
+              - action: input_text.set_value
+                target:
+                  entity_id: "{{ detail_helper }}"
+                data:
+                  value: "{{ detail[:100] }}"
+
+          # ----- Plain-English explanation (visible in traces; usable on dashboards) -----
+          - variables:
+              rh_live: "{{ states(humidity_sensor) | float(none) }}"
+              volts: "{{ states(voltage_sensor) | float(none) }}"
+              avg_t: "{{ states(avg_temp_sensor) | float(none) }}"
+              avg_rh: "{{ states(avg_humidity_sensor) | float(none) }}"
+              action_taken: >-
+                {%- if want == 'failsafe' -%}
+                  {%- if failsafe == 'off' and is_on -%}turned_off{%- elif failsafe == 'on' and not is_on -%}turned_on{%- else -%}none{%- endif -%}
+                {%- elif want == 'on' and can_on -%}turned_on
+                {%- elif want == 'off' and can_off -%}turned_off
+                {%- else -%}none{%- endif -%}
+              explanation_parts: >-
+                {%- set ns = namespace(l=[]) -%}
+                {%- set cooling = chamber_type == 'cooling' -%}
+                {%- set dev = 'fridge' if cooling else 'heater' -%}
+                {%- set m = mins_since | round(1) -%}
+                {%- set h_lo = target_h - hum_band -%}
+                {%- set h_hi = target_h + hum_band -%}
+
+                {#- ---------- Temperature ---------- -#}
+                {%- if t is none -%}
+                  {%- set ns.l = ns.l + [('temperature', 'the sensor is unavailable. Normal control is suspended and the failsafe ("' ~ failsafe ~ '") is in effect until it comes back.')] -%}
+                {%- else -%}
+                  {%- set pos = 'ABOVE' if t > upper else ('BELOW' if t < lower else 'INSIDE') -%}
+                  {%- set ns.l = ns.l + [('temperature', '' ~ t ~ '°C is ' ~ pos ~ ' the control band of ' ~ (lower | round(1)) ~ '–' ~ (upper | round(1)) ~ '°C (setpoint ' ~ (eff_target | round(1)) ~ ' ±' ~ band ~ '°C; base target ' ~ target_t ~ '°C). The ' ~ dev ~ ' cuts off at ' ~ (cut_off | round(1)) ~ '°C, ' ~ overshoot ~ '°C early, to allow for coast-down.')] -%}
+                {%- endif -%}
+
+                {#- ---------- Humidity ---------- -#}
+                {%- if rh is none -%}
+                  {%- set ns.l = ns.l + [('humidity', 'the smoothed (1h) humidity sensor is unavailable, so humidity assist is paused and the setpoint is not shifted.')] -%}
+                {%- elif not humidity_assist -%}
+                  {%- set ns.l = ns.l + [('humidity', 'the 1h average is ' ~ (rh | round(1)) ~ '% (target ' ~ target_h ~ '%). Humidity assist is turned off, so the setpoint is not shifted.')] -%}
+                {%- elif hum_state == 'ok' -%}
+                  {%- set ns.l = ns.l + [('humidity', 'the 1h average is ' ~ (rh | round(1)) ~ '%, inside the tolerance of ' ~ h_lo ~ '–' ~ h_hi ~ '%, so the setpoint stays at the base target.')] -%}
+                {%- elif cooling and hum_state == 'high' -%}
+                  {%- set ns.l = ns.l + [('humidity', 'the 1h average is ' ~ (rh | round(1)) ~ '%, above ' ~ h_hi ~ '%. The setpoint is lowered by ' ~ assist ~ '°C to ' ~ (eff_target | round(1)) ~ '°C so the compressor runs longer and condenses more moisture onto the cold coil.')] -%}
+                {%- elif cooling -%}
+                  {%- set ns.l = ns.l + [('humidity', 'the 1h average is ' ~ (rh | round(1)) ~ '%, below ' ~ h_lo ~ '%. The setpoint is raised by ' ~ assist ~ '°C to ' ~ (eff_target | round(1)) ~ '°C so the compressor runs less and pulls less moisture out of the air.')] -%}
+                {%- elif hum_state == 'high' -%}
+                  {%- set ns.l = ns.l + [('humidity', 'the 1h average is ' ~ (rh | round(1)) ~ '%, above ' ~ h_hi ~ '%. The setpoint is raised by ' ~ assist ~ '°C to ' ~ (eff_target | round(1)) ~ '°C, because warmer air has lower relative humidity.')] -%}
+                {%- else -%}
+                  {%- set ns.l = ns.l + [('humidity', 'the 1h average is ' ~ (rh | round(1)) ~ '%, below ' ~ h_lo ~ '%. The setpoint is lowered by ' ~ assist ~ '°C to ' ~ (eff_target | round(1)) ~ '°C, because cooler air has higher relative humidity.')] -%}
+                {%- endif -%}
+
+                {#- ---------- Decision ---------- -#}
+                {%- if want == 'failsafe' -%}
+                  {%- set ns.l = ns.l + [('decision', 'failsafe. Action taken: ' ~ action_taken ~ '.')] -%}
+                {%- elif want == 'on' -%}
+                  {%- set edge = 'upper' if cooling else 'lower' -%}
+                  {%- if can_on -%}
+                    {%- set ns.l = ns.l + [('decision', 'the temperature reached the ' ~ edge ~ ' edge, so the ' ~ dev ~ ' needs to run. The switch had been off for ' ~ m ~ ' min, past the ' ~ min_off ~ ' min rest period, so it was turned ON.')] -%}
+                  {%- else -%}
+                    {%- set ns.l = ns.l + [('decision', 'the temperature reached the ' ~ edge ~ ' edge, so the ' ~ dev ~ ' needs to run. It has only been off for ' ~ m ~ ' min, though, and the compressor must rest ' ~ min_off ~ ' min between runs. It is waiting another ' ~ ((min_off - mins_since) | round(1)) ~ ' min.')] -%}
+                  {%- endif -%}
+                {%- elif want == 'off' -%}
+                  {%- set edge = 'lower' if cooling else 'upper' -%}
+                  {%- if can_off -%}
+                    {%- set ns.l = ns.l + [('decision', 'the temperature reached the ' ~ (cut_off | round(1)) ~ '°C cut-off, ' ~ overshoot ~ '°C before the ' ~ edge ~ ' edge of ' ~ ((lower if cooling else upper) | round(1)) ~ '°C. The ' ~ dev ~ ' had run for ' ~ m ~ ' min, past the ' ~ min_on ~ ' min minimum, so it was turned OFF.')] -%}
+                  {%- else -%}
+                    {%- set ns.l = ns.l + [('decision', 'the temperature reached the ' ~ (cut_off | round(1)) ~ '°C cut-off, but the ' ~ dev ~ ' has only run for ' ~ m ~ ' min of its ' ~ min_on ~ ' min minimum. It is staying ON for another ' ~ ((min_on - mins_since) | round(1)) ~ ' min.')] -%}
+                  {%- endif -%}
+                {%- elif is_on -%}
+                  {%- set ns.l = ns.l + [('decision', 'no change. The ' ~ dev ~ ' has been running for ' ~ m ~ ' min and keeps running until the temperature reaches the ' ~ (cut_off | round(1)) ~ '°C cut-off, then coasts toward ' ~ ((lower if cooling else upper) | round(1)) ~ '°C.')] -%}
+                {%- elif cooling and t < lower -%}
+                  {%- set ns.l = ns.l + [('decision', 'no change. The chamber is below the band, and the fridge can only cool, so it stays OFF while the room warms the chamber. It will start once the temperature reaches ' ~ (upper | round(1)) ~ '°C.')] -%}
+                {%- elif (not cooling) and t > upper -%}
+                  {%- set ns.l = ns.l + [('decision', 'no change. The chamber is above the band, and the heater can only heat, so it stays OFF while the chamber cools. It will start once the temperature reaches ' ~ (lower | round(1)) ~ '°C.')] -%}
+                {%- else -%}
+                  {%- set ns.l = ns.l + [('decision', 'no change. The temperature is inside the band and the ' ~ dev ~ ' stays OFF until it reaches ' ~ ((upper if cooling else lower) | round(1)) ~ '°C. It has been off for ' ~ m ~ ' min.')] -%}
+                {%- endif -%}
+
+                {#- ---------- Power check ---------- -#}
+                {%- if action_taken != 'none' -%}
+                  {%- set ns.l = ns.l + [('power', 'the switch was just changed, so the current reading (' ~ amps ~ ' A) will catch up on the next update.')] -%}
+                {%- elif amps is none -%}
+                  {%- set ns.l = ns.l + [('power', 'the current sensor is unavailable, so fault detection is blind.')] -%}
+                {%- elif is_on and amps >= run_amps -%}
+                  {%- set ns.l = ns.l + [('power', 'the switch is ON and drawing ' ~ amps ~ ' A (running threshold ' ~ run_amps ~ ' A), so the ' ~ dev ~ ' is running normally.')] -%}
+                {%- elif is_on -%}
+                  {%- set ns.l = ns.l + [('power', 'the switch is ON but only ' ~ amps ~ ' A is flowing (threshold ' ~ run_amps ~ ' A). The ' ~ dev ~ ' may have tripped its overload, its own thermostat may be satisfied, or it may be unplugged. A fault alert fires after ' ~ fault_min ~ ' min in this state.')] -%}
+                {%- elif amps > run_amps -%}
+                  {%- set ns.l = ns.l + [('power', 'the switch is OFF but ' ~ amps ~ ' A is still flowing. The relay may be stuck, or the Sonoff state may be out of sync.')] -%}
+                {%- else -%}
+                  {%- set ns.l = ns.l + [('power', 'the switch is OFF at ' ~ amps ~ ' A, as expected.')] -%}
+                {%- endif -%}
+                {%- if volts is not none -%}
+                  {%- set ns.l = ns.l + [('supply', '' ~ volts ~ ' V' ~ (' (below the ' ~ min_v ~ ' V alert level)' if volts < min_v else ', normal') ~ '.')] -%}
+                {%- endif -%}
+
+                {#- ---------- 24h context ---------- -#}
+                {%- if avg_t is not none and avg_rh is not none -%}
+                  {%- set ns.l = ns.l + [('averages', '' ~ (avg_t | round(1)) ~ '°C (' ~ ('%+.1f' | format(avg_t - target_t)) ~ ' from target) and ' ~ (avg_rh | round(0) | int) ~ '% RH (' ~ ('%+d' | format((avg_rh - target_h) | round(0) | int)) ~ ' from target). Live RH is ' ~ rh_live ~ '%, which swings with each compressor cycle and is why the 1h average is used for decisions.')] -%}
+                {%- endif -%}
+                {{ dict(ns.l) }}
+          - variables:
+              explanation: >-
+                {%- set labels = {'temperature': 'Temperature', 'humidity': 'Humidity', 'decision': 'Decision', 'power': 'Power', 'supply': 'Supply', 'averages': '24h averages'} -%}
+                {%- for k, v in explanation_parts.items() -%}
+                  {{ labels[k] }}: {{ v }}{{ '\n' if not loop.last else '' }}
+                {%- endfor -%}
+
+          # ----- MQTT status sensor (optional) -----
+          - if:
+              - "{{ mqtt_enabled }}"
+            then:
+              # Create the sensor via MQTT discovery if it doesn't exist yet
+              - if:
+                  - >-
+                    {{ states.sensor | selectattr('attributes.mqtt_topic', 'defined')
+                       | selectattr('attributes.mqtt_topic', 'eq', mqtt_base) | list | count == 0 }}
+                then:
+                  - action: mqtt.publish
+                    data:
+                      topic: "homeassistant/sensor/{{ mqtt_base }}/status/config"
+                      retain: true
+                      payload: >-
+                        {{ {
+                          'name': 'Status',
+                          'unique_id': mqtt_base ~ '_status',
+                          'state_topic': mqtt_base ~ '/state',
+                          'value_template': '{{ value_json.status }}',
+                          'json_attributes_topic': mqtt_base ~ '/state',
+                          'icon': 'mdi:fridge-industrial-outline',
+                          'device': {
+                            'identifiers': [mqtt_base],
+                            'name': mqtt_base | replace('_', ' ') | title,
+                            'model': 'Curing Chamber Controller (blueprint)'
+                          }
+                        } | tojson }}
+              - action: mqtt.publish
+                data:
+                  topic: "{{ mqtt_base }}/state"
+                  retain: true
+                  payload: >-
+                    {{ dict(explanation_parts,
+                        status=status,
+                        detail=detail,
+                        explanation=explanation,
+                        mode=chamber_type,
+                        temp=t,
+                        rh_1h=rh,
+                        rh_live=rh_live,
+                        setpoint=eff_target | round(2),
+                        band_low=lower | round(2),
+                        band_high=upper | round(2),
+                        cut_off=cut_off | round(2),
+                        decision_code=want,
+                        action_taken=action_taken,
+                        minutes_in_state=mins_since | round(1),
+                        amps=amps,
+                        volts=volts,
+                        updated=now().isoformat(),
+                        mqtt_topic=mqtt_base) | tojson }}
+
+      # ================= NOTIFICATIONS =================
+      - conditions: "{{ trigger.id != 'summary' or daily_summary }}"
+        sequence:
+          - variables:
+              t_now: "{{ states(temp_sensor) }}"
+              rh_now: "{{ states(humidity_sensor) }}"
+              amps: "{{ states(current_sensor) }}"
+              volts: "{{ states(voltage_sensor) }}"
+              avg_t: "{{ states(avg_temp_sensor) | float(none) }}"
+              avg_rh: "{{ states(avg_humidity_sensor) | float(none) }}"
+              pwr: "{{ 'ON' if is_state(power_switch, 'on') else 'OFF' }}"
+              title: >-
+                {%- set titles = {
+                  'temp_high': 'Curing chamber too warm',
+                  'temp_low': 'Curing chamber too cold',
+                  'hum_high': 'Curing chamber humidity high',
+                  'hum_low': 'Curing chamber humidity low',
+                  'no_current': 'Chamber power fault',
+                  'stuck_relay': 'Chamber switch not responding',
+                  'low_voltage': 'Chamber low voltage',
+                  'long_run': 'Chamber running continuously',
+                  'sensor_lost': 'Chamber sensor offline',
+                  'summary': 'Curing chamber daily summary'
+                } -%}
+                {{ titles.get(trigger.id, 'Curing chamber') }}
+              message: >-
+                {%- set id = trigger.id -%}
+                {%- if id in ['temp_high', 'temp_low'] -%}
+                  {{ t_now }}°C (target {{ target_t }}°C). Power is {{ pwr }}, drawing {{ amps }} A.
+                  {%- if id == 'temp_high' %} Check the door seal and whether the compressor is running.{% endif -%}
+                {%- elif id == 'hum_high' -%}
+                  1h avg RH {{ states(smoothed_humidity_sensor) }}% (target {{ target_h }}%). Try more airflow (a small fan), wiping condensation, or a desiccant.
+                {%- elif id == 'hum_low' -%}
+                  1h avg RH {{ states(smoothed_humidity_sensor) }}% (target {{ target_h }}%). Add more open water (a wider tray, or a wet towel wicking from it) or a humidifier. Temperature control alone can't add moisture.
+                {%- elif id == 'no_current' -%}
+                  Switch is ON but only {{ amps }} A is flowing. The compressor may be tripped on thermal overload or unplugged, or the fridge thermostat isn't set to coldest.
+                {%- elif id == 'stuck_relay' -%}
+                  Switch is OFF but {{ amps }} A is still flowing. The relay may be stuck, or the Sonoff state is out of sync.
+                {%- elif id == 'low_voltage' -%}
+                  Supply voltage is {{ volts }} V. Brownouts are hard on compressors.
+                {%- elif id == 'long_run' -%}
+                  Power has been on continuously and the chamber is at {{ t_now }}°C (target {{ target_t }}°C). Check the door, the room temperature, and the compressor.
+                {%- elif id == 'sensor_lost' -%}
+                  The temperature sensor has been unavailable for 10 minutes. Failsafe is set to "{{ failsafe }}".
+                {%- elif id == 'summary' -%}
+                  24h avg: {% if avg_t is not none %}{{ avg_t | round(1) }}°C ({{ '%+.1f' | format(avg_t - target_t) }}){% else %}n/a{% endif %} / {% if avg_rh is not none %}{{ avg_rh | round(0) | int }}% ({{ '%+d' | format((avg_rh - target_h) | round(0) | int) }}){% else %}n/a{% endif %}.
+                  Now: {{ t_now }}°C / {{ rh_now }}% · Power {{ pwr }} · {{ amps }} A @ {{ volts }} V.
+                  {%- if avg_rh is not none and avg_rh < target_h - hum_band %} Humidity is running low, so add more water surface area.
+                  {%- elif avg_rh is not none and avg_rh > target_h + hum_band %} Humidity is running high, so consider adding airflow.{% endif -%}
+                {%- endif -%}
+          - domain: mobile_app
+            type: notify
+            device_id: !input notify_device
+            title: "{{ title }}"
+            message: "{{ message }}"
