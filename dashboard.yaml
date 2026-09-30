@@ -351,8 +351,7 @@ sections:
             decimals: 0
             show: false
         series:
-          - entity: sensor.curing_chamber_status
-            attribute: amps
+          - entity: sensor.living_room_curing_chamber_sonoff_10018b4516_current
             name: Current
             unit: A
             yaxis_id: amps
@@ -361,8 +360,16 @@ sections:
             curve: stepline
             opacity: 0.3
             stroke_width: 1.5
-          - entity: sensor.curing_chamber_status
-            attribute: volts
+          # Header only: live wattage
+          - entity: sensor.living_room_curing_chamber_sonoff_10018b4516_power
+            name: Power
+            unit: W
+            yaxis_id: amps
+            color: "#43a047"
+            float_precision: 0
+            show:
+              in_chart: false
+          - entity: sensor.living_room_curing_chamber_sonoff_10018b4516_voltage
             name: Supply
             unit: V
             yaxis_id: volts
