@@ -416,10 +416,10 @@ sections:
           columns: full
         content: |-
           {% set e = 'sensor.curing_chamber_status' %}
-          {% macro cap(s) %}{{ s[:1] | upper ~ s[1:] if s else '—' }}{% endmacro %}
+          {% macro cap(s) %}{% set s = s | string if s is not none else '' %}{{ s[:1] | upper ~ s[1:] if s else '—' }}{% endmacro %}
           {% set rows = [
             ('mdi:thermometer', 'Temperature', 'temperature'),
-            ('mdi:thermometer-lines', '1h temperature', 'temp_1h'),
+            ('mdi:thermometer-lines', '1h temperature', 'temp_trend'),
             ('mdi:water-percent', 'Humidity', 'humidity'),
             ('mdi:power-socket', 'Power', 'power'),
             ('mdi:sine-wave', 'Supply', 'supply'),

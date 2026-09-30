@@ -828,7 +828,7 @@ actions:
                       {%- set msg = msg ~ ' If this persists, the ' ~ dev ~ ' may be struggling to keep up, or the rest time is holding it off too long.' -%}
                     {%- endif -%}
                   {%- endif -%}
-                  {%- set ns.l = ns.l + [('temp_1h', msg)] -%}
+                  {%- set ns.l = ns.l + [('temp_trend', msg)] -%}
                 {%- endif -%}
 
                 {#- ---------- Humidity ---------- -#}
@@ -924,7 +924,7 @@ actions:
                 {{ dict(ns.l) }}
           - variables:
               explanation: >-
-                {%- set labels = {'temperature': 'Temperature', 'temp_1h': '1h temperature', 'humidity': 'Humidity', 'decision': 'Decision', 'power': 'Power', 'supply': 'Supply', 'cycle': 'Learned cycle', 'averages': '24h averages'} -%}
+                {%- set labels = {'temperature': 'Temperature', 'temp_trend': '1h temperature', 'humidity': 'Humidity', 'decision': 'Decision', 'power': 'Power', 'supply': 'Supply', 'cycle': 'Learned cycle', 'averages': '24h averages'} -%}
                 {%- for k, v in explanation_parts.items() -%}
                   {{ labels[k] }}: {{ v }}{{ '\n' if not loop.last else '' }}
                 {%- endfor -%}
