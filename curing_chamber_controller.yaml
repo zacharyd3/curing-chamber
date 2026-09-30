@@ -10,6 +10,11 @@ blueprint:
     faults and stuck relays, and voltage to catch brownouts. Sends alerts, plus
     an optional daily summary built from the 24-hour averages.
 
+    With an optional memory helper, it learns the chamber's typical on/off cycle
+    for each 3-hour slot of the day. If the temperature sensor drops out or
+    goes stale, it can keep cycling on that learned schedule. The same helper
+    enables a defrost rest after very long compressor runs.
+
     Optionally publishes a full status sensor (with a plain-English explanation of
     every decision) over MQTT discovery.
 
@@ -48,6 +53,19 @@ blueprint:
             entity:
               filter:
                 domain: sensor
+        smoothed_temp_sensor:
+          name: Smoothed temperature (1h mean) (optional)
+          description: >
+            A Statistics helper (mean, max age 1 hour) on the live temperature
+            sensor. Shown on the dashboard and in alerts. It is also compared with
+            the setpoint to tell you if the chamber sits off-centre in the band,
+            which usually means overshoot compensation needs tuning. Control
+            itself always uses the live temperature.
+          default: ""
+          selector:
+            entity:
+              filter:
+                domain: sensor
         avg_temp_sensor:
           name: 24h average temperature
           selector:
@@ -56,6 +74,17 @@ blueprint:
                 domain: sensor
         avg_humidity_sensor:
           name: 24h average humidity
+          selector:
+            entity:
+              filter:
+                domain: sensor
+        duty_sensor:
+          name: 24h run time (optional)
+          description: >
+            A History stats helper on the chamber power switch (state "on",
+            type "ratio" or "time", end "{{ now() }}", duration 24 hours). Adds the
+            duty cycle to the daily summary.
+          default: ""
           selector:
             entity:
               filter:
@@ -232,7 +261,11 @@ blueprint:
               max: 240
               unit_of_measurement: V
         failsafe:
-          name: If the temperature sensor goes unavailable
+          name: If the temperature sensor goes unavailable or stale
+          description: >
+            "Follow the learned cycle" keeps the chamber cycling on the typical
+            on/off times learned for this time of day (see Cycle learning). If
+            nothing has been learned yet, it turns power off.
           default: leave
           selector:
             select:
@@ -243,6 +276,64 @@ blueprint:
                   value: "off"
                 - label: Turn power on
                   value: "on"
+                - label: Follow the learned cycle
+                  value: learned
+        stale_minutes:
+          name: Stale sensor timeout
+          description: >
+            Treat the live temperature or humidity sensor as stale if it has not
+            reported for this long, even though it still shows a value (a dead
+            battery or dropped radio link often looks like this). A stale
+            temperature sensor triggers the failsafe; a stale humidity sensor
+            pauses humidity assist. Set it longer than the sensor's normal
+            reporting interval. 0 turns this off.
+          default: 60
+          selector:
+            number:
+              min: 0
+              max: 360
+              unit_of_measurement: min
+        defrost_after_minutes:
+          name: Defrost after continuous run (cooling only)
+          description: >
+            If the compressor runs this long without reaching its cut-off, it is
+            switched off for a defrost rest so ice can melt off the coil. Keep it
+            below the continuous run alert. Needs the memory helper. 0 turns this off.
+          default: 0
+          selector:
+            number:
+              min: 0
+              max: 480
+              unit_of_measurement: min
+        defrost_minutes:
+          name: Defrost rest length
+          default: 15
+          selector:
+            number:
+              min: 5
+              max: 60
+              unit_of_measurement: min
+
+    learning:
+      name: Cycle learning
+      icon: mdi:chart-timeline-variant
+      collapsed: true
+      input:
+        memory_helper:
+          name: Memory helper (optional)
+          description: >
+            An input_text helper with its Maximum length set to 255. The
+            controller stores what it learns here: a running average of the
+            on and off times of normal thermostat cycles for each 3-hour slot
+            of the day, plus the defrost timer. Cycles that were started or ended
+            by hand, by the failsafe, by a defrost, or around a restart are left
+            out. A slot needs 3 clean cycles before it is used; empty slots borrow
+            from the nearest learned one. Clear the helper to start learning again.
+          default: ""
+          selector:
+            entity:
+              filter:
+                domain: input_text
     alerts:
       name: Notifications
       icon: mdi:bell
@@ -286,6 +377,20 @@ blueprint:
               min: 5
               max: 360
               unit_of_measurement: min
+        notify_defrost:
+          name: Notify when a defrost rest starts
+          default: true
+          selector:
+            boolean:
+        duty_warn:
+          name: High duty-cycle warning
+          description: The daily summary flags the day if power was on for more than this share of the last 24 hours.
+          default: 70
+          selector:
+            number:
+              min: 10
+              max: 100
+              unit_of_measurement: "%"
         daily_summary:
           name: Send daily summary
           default: true
@@ -356,6 +461,8 @@ trigger_variables:
   tv_alarm_h: !input humidity_alarm_offset
   tv_amps: !input running_amps
   tv_min_v: !input min_voltage
+  tv_hum_live: !input humidity_sensor
+  tv_stale: !input stale_minutes
 
 triggers:
   # --- Control loop ---
@@ -422,6 +529,17 @@ triggers:
       - unknown
     for:
       minutes: 10
+  # Stale: the sensor still shows a number but hasn't reported for too long
+  - trigger: template
+    id: temp_stale
+    value_template: >-
+      {% set s = states[tv_temp] %}{{ tv_stale > 0 and s is not none and is_number(s.state)
+         and (now() - s.last_reported).total_seconds() > tv_stale * 60 }}
+  - trigger: template
+    id: hum_stale
+    value_template: >-
+      {% set s = states[tv_hum_live] %}{{ tv_stale > 0 and s is not none and is_number(s.state)
+         and (now() - s.last_reported).total_seconds() > tv_stale * 60 }}
   - trigger: time
     id: summary
     at: !input summary_time
@@ -454,6 +572,63 @@ variables:
   mqtt_base: !input mqtt_base
   detail_helper: !input detail_helper
   min_v: !input min_voltage
+  smoothed_temp_sensor: !input smoothed_temp_sensor
+  duty_sensor: !input duty_sensor
+  duty_warn: !input duty_warn
+  memory_helper: !input memory_helper
+  stale_min: !input stale_minutes
+  defrost_after: !input defrost_after_minutes
+  defrost_min: !input defrost_minutes
+  notify_defrost: !input notify_defrost
+  now_ts: "{{ as_timestamp(now()) }}"
+  temp_stale: >-
+    {%- set s = states[temp_sensor] -%}
+    {{ stale_min > 0 and s is not none and is_number(s.state) and (now() - s.last_reported).total_seconds() > stale_min * 60 }}
+  hum_stale: >-
+    {%- set s = states[humidity_sensor] -%}
+    {{ stale_min > 0 and s is not none and is_number(s.state) and (now() - s.last_reported).total_seconds() > stale_min * 60 }}
+  # Learned cycle memory, stored in the input_text as
+  #   on-times | off-times | on-counts | off-counts | last-switch-time | defrost-until
+  # Each list has 8 values, one per 3-hour slot of the day (00-03, 03-06, ...).
+  # Times are running averages in minutes; counts stop at 9, so each new cycle
+  # moves the average by at least 10%.
+  mem: >-
+    {%- set z = [0, 0, 0, 0, 0, 0, 0, 0] -%}
+    {%- set raw = states(memory_helper) if memory_helper != '' else '' -%}
+    {%- set f = raw.split('|') -%}
+    {%- set ns = namespace(l=[], ok=f | count == 6) -%}
+    {%- for s in f[:4] -%}
+      {%- set vals = s.split(',') | map('float', 0) | list -%}
+      {%- set ns.ok = ns.ok and vals | count == 8 -%}
+      {%- set ns.l = ns.l + [vals] -%}
+    {%- endfor -%}
+    {%- if ns.ok -%}
+      {{ {'on': ns.l[0], 'off': ns.l[1], 'cn': ns.l[2] | map('int') | list, 'cf': ns.l[3] | map('int') | list, 't': f[4] | int(0), 'd': f[5] | int(0)} }}
+    {%- else -%}
+      {{ {'on': z, 'off': z, 'cn': z, 'cf': z, 't': 0, 'd': 0} }}
+    {%- endif -%}
+  # Typical cycle for right now: this slot if it has 3+ clean cycles of each kind,
+  # otherwise the nearest slot(s) that do. None if nothing has been learned yet.
+  cyc_slot: "{{ now().hour // 3 }}"
+  cyc_now: >-
+    {%- set ns = namespace(on=[], off=[], dist=none) -%}
+    {%- for d in range(5) -%}
+      {%- if ns.dist is none -%}
+        {%- for i in [(cyc_slot + d) % 8, (cyc_slot - d) % 8] | unique -%}
+          {%- if mem.cn[i] >= 3 and mem.cf[i] >= 3 -%}
+            {%- set ns.on = ns.on + [mem.on[i]] -%}
+            {%- set ns.off = ns.off + [mem.off[i]] -%}
+          {%- endif -%}
+        {%- endfor -%}
+        {%- if ns.on | count > 0 -%}{%- set ns.dist = d -%}{%- endif -%}
+      {%- endif -%}
+    {%- endfor -%}
+    {%- if ns.dist is none -%}{{ none }}
+    {%- else -%}
+      {%- set on = (ns.on | sum / ns.on | count) | round(1) -%}
+      {%- set off = (ns.off | sum / ns.off | count) | round(1) -%}
+      {{ {'on': on, 'off': off, 'duty': (100 * on / [on + off, 0.1] | max) | round(0) | int, 'hours_away': ns.dist * 3} }}
+    {%- endif -%}
 
 actions:
   - choose:
@@ -461,8 +636,10 @@ actions:
       - conditions: "{{ trigger.id == 'control' }}"
         sequence:
           - variables:
-              t: "{{ states(temp_sensor) | float(none) }}"
-              rh: "{{ states(smoothed_humidity_sensor) | float(none) }}"
+              # A stale sensor is treated the same as an unavailable one
+              t: "{{ none if temp_stale else states(temp_sensor) | float(none) }}"
+              rh: "{{ none if hum_stale else states(smoothed_humidity_sensor) | float(none) }}"
+              t_1h: "{{ states(smoothed_temp_sensor) | float(none) if smoothed_temp_sensor != '' else none }}"
               amps: "{{ states(current_sensor) | float(none) }}"
               sw_ok: "{{ states(power_switch) in ['on', 'off'] }}"
               is_on: "{{ is_state(power_switch, 'on') }}"
@@ -476,8 +653,13 @@ actions:
               lower: "{{ eff_target - band }}"
               # Early cut-off to allow for coast-down after power is removed
               cut_off: "{{ [lower + overshoot, eff_target] | min if chamber_type == 'cooling' else [upper - overshoot, eff_target] | max }}"
+              # Defrost needs the memory helper to remember when the rest ends
+              defrost_on: "{{ chamber_type == 'cooling' and defrost_after > 0 and memory_helper != '' }}"
+              defrost_left: "{{ ((mem.d - now_ts) / 60) if defrost_on and mem.d > now_ts else 0 }}"
               want: >-
-                {%- if t is none -%}failsafe
+                {%- if defrost_left > 0 -%}defrost_hold
+                {%- elif t is none -%}failsafe
+                {%- elif defrost_on and is_on and mins_since >= defrost_after and t > cut_off -%}defrost
                 {%- elif chamber_type == 'cooling' -%}
                   {%- if not is_on and t >= upper -%}on{%- elif is_on and t <= cut_off -%}off{%- else -%}none{%- endif -%}
                 {%- else -%}
@@ -485,46 +667,95 @@ actions:
                 {%- endif -%}
               can_on: "{{ mins_since >= min_off }}"
               can_off: "{{ mins_since >= min_on }}"
+              # What actually gets done this run: on, off or none
+              act: >-
+                {%- if want == 'defrost' -%}off
+                {%- elif want == 'defrost_hold' -%}{{ 'off' if is_on else 'none' }}
+                {%- elif want == 'failsafe' -%}
+                  {%- if failsafe == 'off' or (failsafe == 'learned' and cyc_now is none) -%}{{ 'off' if is_on else 'none' }}
+                  {%- elif failsafe == 'on' -%}{{ 'none' if is_on else 'on' }}
+                  {%- elif failsafe == 'learned' and is_on -%}{{ 'off' if mins_since >= [cyc_now.on, min_on] | max else 'none' }}
+                  {%- elif failsafe == 'learned' -%}{{ 'on' if mins_since >= [cyc_now.off, min_off] | max else 'none' }}
+                  {%- else -%}none{%- endif -%}
+                {%- elif want == 'on' and can_on -%}on
+                {%- elif want == 'off' and can_off -%}off
+                {%- else -%}none{%- endif -%}
+              # A normal thermostat switch (not failsafe, defrost or manual)
+              normal_act: "{{ want in ['on', 'off'] and act == want }}"
+
+          # ----- Cycle learning -----
+          # The period that is ending now is a clean sample only if it also began with a
+          # normal thermostat switch made by this controller (its time is saved in the memory).
+          # Anything else in between (manual toggle, failsafe, defrost, restart, relay
+          # dropout) changes the switch's last_changed and the sample is skipped.
+          - if:
+              - "{{ memory_helper != '' and sw_ok and (normal_act or want == 'defrost') }}"
+            then:
+              - variables:
+                  lc_ts: "{{ as_timestamp(states[power_switch].last_changed) }}"
+                  sample_ok: "{{ normal_act and mem.t > 0 and (lc_ts - mem.t) | abs < 90 and mins_since >= 0.5 and mins_since <= 360 }}"
+                  # Slot at the middle of the period that is ending
+                  sample_slot: "{{ ((now_ts - mins_since * 30) | timestamp_custom('%H', true) | int) // 3 }}"
+                  mem_out: >-
+                    {%- set ns = namespace(on=mem.on, off=mem.off, cn=mem.cn, cf=mem.cf) -%}
+                    {%- set b = sample_slot | int -%}
+                    {%- if sample_ok and is_on -%}
+                      {%- set n = ns.cn[b] -%}
+                      {%- set ns.on = ns.on[:b] + [(ns.on[b] + (mins_since - ns.on[b]) / (n + 1)) | round(1)] + ns.on[b + 1:] -%}
+                      {%- set ns.cn = ns.cn[:b] + [[n + 1, 9] | min] + ns.cn[b + 1:] -%}
+                    {%- elif sample_ok -%}
+                      {%- set n = ns.cf[b] -%}
+                      {%- set ns.off = ns.off[:b] + [(ns.off[b] + (mins_since - ns.off[b]) / (n + 1)) | round(1)] + ns.off[b + 1:] -%}
+                      {%- set ns.cf = ns.cf[:b] + [[n + 1, 9] | min] + ns.cf[b + 1:] -%}
+                    {%- endif -%}
+                    {{ ns.on | join(',') }}|{{ ns.off | join(',') }}|{{ ns.cn | join(',') }}|{{ ns.cf | join(',') }}|{{ (now_ts | int) if normal_act else 0 }}|{{ ((now_ts + defrost_min * 60) | int) if want == 'defrost' else mem.d }}
+              - if:
+                  - "{{ mem_out | length <= state_attr(memory_helper, 'max') | int(100) }}"
+                then:
+                  - action: input_text.set_value
+                    target:
+                      entity_id: "{{ memory_helper }}"
+                    data:
+                      value: "{{ mem_out }}"
+                    continue_on_error: true
+
           - choose:
-              # Temperature sensor missing -> failsafe
-              - conditions: "{{ want == 'failsafe' and failsafe == 'off' and is_on }}"
-                sequence:
-                  - action: switch.turn_off
-                    target:
-                      entity_id: "{{ power_switch }}"
-                    continue_on_error: true
-              - conditions: "{{ want == 'failsafe' and failsafe == 'on' and not is_on }}"
+              - conditions: "{{ act == 'on' }}"
                 sequence:
                   - action: switch.turn_on
                     target:
                       entity_id: "{{ power_switch }}"
                     continue_on_error: true
-              # Normal thermostat control
-              - conditions: "{{ want == 'on' and can_on }}"
-                sequence:
-                  - action: switch.turn_on
-                    target:
-                      entity_id: "{{ power_switch }}"
-                    continue_on_error: true
-              - conditions: "{{ want == 'off' and can_off }}"
+              - conditions: "{{ act == 'off' }}"
                 sequence:
                   - action: switch.turn_off
                     target:
                       entity_id: "{{ power_switch }}"
                     continue_on_error: true
+          - if:
+              - "{{ want == 'defrost' and notify_defrost }}"
+            then:
+              - domain: mobile_app
+                type: notify
+                device_id: !input notify_device
+                title: Chamber defrost rest
+                message: >-
+                  The compressor ran {{ mins_since | round(0) | int }} min without getting down to
+                  {{ cut_off | round(1) }}°C (now {{ t }}°C), so it is resting {{ defrost_min }} min to let
+                  the coil defrost. If this keeps happening, check the door seal, the room temperature
+                  and the coil for ice.
 
           # ----- Dashboard status -----
           - variables:
-              now_on: >-
-                {%- if want == 'failsafe' -%}{{ failsafe == 'on' or (failsafe == 'leave' and is_on) }}
-                {%- elif want == 'on' -%}{{ can_on }}
-                {%- elif want == 'off' -%}{{ not can_off }}
-                {%- else -%}{{ is_on }}{%- endif -%}
+              now_on: "{{ act == 'on' or (is_on and act != 'off') }}"
               verb: "{{ 'Cooling' if chamber_type == 'cooling' else 'Heating' }}"
               hum_note: "{% if (shift | float(0)) != 0 %}{{ ' · drying' if hum_state == 'high' else ' · retaining moisture' }}{% endif %}"
               status: >-
                 {%- if not sw_ok -%}Offline · switch unavailable
-                {%- elif want == 'failsafe' -%}Failsafe · temp sensor offline
+                {%- elif want in ['defrost', 'defrost_hold'] -%}Defrost · {{ (defrost_min if want == 'defrost' else defrost_left) | round(0, 'ceil') | int }}m left
+                {%- elif want == 'failsafe' -%}Failsafe · temp sensor {{ 'stale' if temp_stale else 'offline' }}
+                  {%- if failsafe == 'learned' and cyc_now is none %} · nothing learned, off
+                  {%- elif failsafe == 'learned' %} · learned cycle, {{ 'on' if now_on else 'off' }}{% endif -%}
                 {%- elif now_on -%}
                   {%- if is_on and mins_since >= fault_min and amps is not none and amps < run_amps -%}Fault · no current draw
                   {%- elif want == 'off' -%}{{ verb }} · min run {{ (min_on - mins_since) | round(0, 'ceil') | int }}m left
@@ -534,7 +765,8 @@ actions:
                 {%- elif chamber_type == 'heating' and t > upper -%}Idle · cooling to {{ upper | round(1) }}°C
                 {%- else -%}Idle{{ hum_note }}{%- endif -%}
               detail: >-
-                {{ t if t is not none else '—' }}°C · {{ rh | round(0) | int if rh is not none else '—' }}% RH (1h)
+                {{ t if t is not none else '—' }}°C{{ ' (1h ' ~ (t_1h | round(1)) ~ ')' if t_1h is not none else '' }}
+                · {{ rh | round(0) | int if rh is not none else '—' }}% RH (1h)
                 · setpoint {{ eff_target | round(1) }} ±{{ band }}°C · {{ amps if amps is not none else '—' }} A
           - if:
               - "{{ status_helper != '' and states(status_helper) != status }}"
@@ -559,12 +791,7 @@ actions:
               volts: "{{ states(voltage_sensor) | float(none) }}"
               avg_t: "{{ states(avg_temp_sensor) | float(none) }}"
               avg_rh: "{{ states(avg_humidity_sensor) | float(none) }}"
-              action_taken: >-
-                {%- if want == 'failsafe' -%}
-                  {%- if failsafe == 'off' and is_on -%}turned_off{%- elif failsafe == 'on' and not is_on -%}turned_on{%- else -%}none{%- endif -%}
-                {%- elif want == 'on' and can_on -%}turned_on
-                {%- elif want == 'off' and can_off -%}turned_off
-                {%- else -%}none{%- endif -%}
+              action_taken: "{{ {'on': 'turned_on', 'off': 'turned_off'}.get(act, 'none') }}"
               explanation_parts: >-
                 {%- set ns = namespace(l=[]) -%}
                 {%- set cooling = chamber_type == 'cooling' -%}
@@ -574,15 +801,40 @@ actions:
                 {%- set h_hi = target_h + hum_band -%}
 
                 {#- ---------- Temperature ---------- -#}
-                {%- if t is none -%}
+                {%- if t is none and temp_stale -%}
+                  {%- set ns.l = ns.l + [('temperature', 'the sensor still shows ' ~ states(temp_sensor) ~ '°C but has not reported for over ' ~ stale_min ~ ' min, so that reading is treated as stale and ignored. Normal control is suspended and the failsafe ("' ~ failsafe ~ '") is in effect until it reports again.')] -%}
+                {%- elif t is none -%}
                   {%- set ns.l = ns.l + [('temperature', 'the sensor is unavailable. Normal control is suspended and the failsafe ("' ~ failsafe ~ '") is in effect until it comes back.')] -%}
                 {%- else -%}
                   {%- set pos = 'ABOVE' if t > upper else ('BELOW' if t < lower else 'INSIDE') -%}
                   {%- set ns.l = ns.l + [('temperature', '' ~ t ~ '°C is ' ~ pos ~ ' the control band of ' ~ (lower | round(1)) ~ '–' ~ (upper | round(1)) ~ '°C (setpoint ' ~ (eff_target | round(1)) ~ ' ±' ~ band ~ '°C; base target ' ~ target_t ~ '°C). The ' ~ dev ~ ' cuts off at ' ~ (cut_off | round(1)) ~ '°C, ' ~ overshoot ~ '°C early, to allow for coast-down.')] -%}
                 {%- endif -%}
 
+                {#- ---------- 1h temperature ---------- -#}
+                {%- if t_1h is not none -%}
+                  {%- set dt = t_1h - eff_target -%}
+                  {%- set msg = 'the 1h average is ' ~ (t_1h | round(1)) ~ '°C, ' ~ ('%+.1f' | format(dt)) ~ '°C from the ' ~ (eff_target | round(1)) ~ '°C setpoint' -%}
+                  {%- if dt | abs <= band / 2 -%}
+                    {%- set msg = msg ~ ', well centred in the band.' -%}
+                  {%- else -%}
+                    {#- Sitting on the side the device pushes toward means it coasts too far -#}
+                    {%- set coasting = (dt < 0) == cooling -%}
+                    {%- set msg = msg ~ ', so the chamber spends most of its time in the ' ~ ('lower' if dt < 0 else 'upper') ~ ' half of the band.' -%}
+                    {%- if coasting -%}
+                      {%- set msg = msg ~ ' If this persists, the ' ~ dev ~ ' is coasting past its cut-off; try raising overshoot compensation (now ' ~ overshoot ~ '°C).' -%}
+                    {%- elif overshoot > 0 -%}
+                      {%- set msg = msg ~ ' If this persists, the ' ~ dev ~ ' may be cutting off too early; try lowering overshoot compensation (now ' ~ overshoot ~ '°C).' -%}
+                    {%- else -%}
+                      {%- set msg = msg ~ ' If this persists, the ' ~ dev ~ ' may be struggling to keep up, or the rest time is holding it off too long.' -%}
+                    {%- endif -%}
+                  {%- endif -%}
+                  {%- set ns.l = ns.l + [('temp_1h', msg)] -%}
+                {%- endif -%}
+
                 {#- ---------- Humidity ---------- -#}
-                {%- if rh is none -%}
+                {%- if rh is none and hum_stale -%}
+                  {%- set ns.l = ns.l + [('humidity', 'the live humidity sensor has not reported for over ' ~ stale_min ~ ' min, so its readings are treated as stale. Humidity assist is paused and the setpoint is not shifted.')] -%}
+                {%- elif rh is none -%}
                   {%- set ns.l = ns.l + [('humidity', 'the smoothed (1h) humidity sensor is unavailable, so humidity assist is paused and the setpoint is not shifted.')] -%}
                 {%- elif not humidity_assist -%}
                   {%- set ns.l = ns.l + [('humidity', 'the 1h average is ' ~ (rh | round(1)) ~ '% (target ' ~ target_h ~ '%). Humidity assist is turned off, so the setpoint is not shifted.')] -%}
@@ -599,7 +851,16 @@ actions:
                 {%- endif -%}
 
                 {#- ---------- Decision ---------- -#}
-                {%- if want == 'failsafe' -%}
+                {%- if want == 'defrost' -%}
+                  {%- set ns.l = ns.l + [('decision', 'defrost. The fridge has run continuously for ' ~ m ~ ' min (limit ' ~ defrost_after ~ ' min) without reaching its ' ~ (cut_off | round(1)) ~ '°C cut-off, so it was turned OFF for a ' ~ defrost_min ~ ' min rest to let ice melt off the coil.')] -%}
+                {%- elif want == 'defrost_hold' -%}
+                  {%- set ns.l = ns.l + [('decision', 'defrost rest in progress. The fridge stays OFF for another ' ~ (defrost_left | round(1)) ~ ' min whatever the temperature' ~ (', so it was turned OFF again' if act == 'off' else '') ~ '.')] -%}
+                {%- elif want == 'failsafe' and failsafe == 'learned' and cyc_now is none -%}
+                  {%- set ns.l = ns.l + [('decision', 'failsafe: follow the learned cycle, but no cycle has been learned yet, so the ' ~ dev ~ ' is kept OFF. Action taken: ' ~ action_taken ~ '.')] -%}
+                {%- elif want == 'failsafe' and failsafe == 'learned' -%}
+                  {%- set lim = ([cyc_now.on, min_on] | max) if is_on else ([cyc_now.off, min_off] | max) -%}
+                  {%- set ns.l = ns.l + [('decision', 'failsafe: following the learned cycle of ' ~ cyc_now.on ~ ' min on / ' ~ cyc_now.off ~ ' min off. The ' ~ dev ~ ' has been ' ~ ('ON' if is_on else 'OFF') ~ ' for ' ~ m ~ ' of ' ~ (lim | round(1)) ~ ' min' ~ ((', so it was turned ' ~ (act | upper)) if act != 'none' else '') ~ '.')] -%}
+                {%- elif want == 'failsafe' -%}
                   {%- set ns.l = ns.l + [('decision', 'failsafe. Action taken: ' ~ action_taken ~ '.')] -%}
                 {%- elif want == 'on' -%}
                   {%- set edge = 'upper' if cooling else 'lower' -%}
@@ -643,6 +904,19 @@ actions:
                   {%- set ns.l = ns.l + [('supply', '' ~ volts ~ ' V' ~ (' (below the ' ~ min_v ~ ' V alert level)' if volts < min_v else ', normal') ~ '.')] -%}
                 {%- endif -%}
 
+                {#- ---------- Learned cycle ---------- -#}
+                {%- set slot = '%02d:00–%02d:00' | format(cyc_slot * 3, (cyc_slot * 3 + 3) % 24) -%}
+                {%- if memory_helper == '' -%}
+                  {%- set ns.l = ns.l + [('cycle', 'no memory helper is set, so on/off cycles are not being learned' ~ (' and defrost is disabled' if chamber_type == 'cooling' and defrost_after > 0 else '') ~ '.')] -%}
+                {%- elif state_attr(memory_helper, 'max') | int(100) < 160 -%}
+                  {%- set ns.l = ns.l + [('cycle', 'the memory helper only holds ' ~ state_attr(memory_helper, 'max') ~ ' characters, which is not enough to store what is learned. Set its Maximum length to 255.')] -%}
+                {%- elif cyc_now is none -%}
+                  {%- set ns.l = ns.l + [('cycle', 'still learning. The ' ~ slot ~ ' slot has ' ~ mem.cn[cyc_slot] ~ ' clean on-periods and ' ~ mem.cf[cyc_slot] ~ ' clean off-periods recorded (3 of each needed), and no other slot has enough yet.')] -%}
+                {%- else -%}
+                  {%- set src = ('learned for the ' ~ slot ~ ' slot') if cyc_now.hours_away == 0 else ('borrowed from the nearest learned slot, ' ~ cyc_now.hours_away ~ ' h away, because the ' ~ slot ~ ' slot is still learning') -%}
+                  {%- set ns.l = ns.l + [('cycle', 'typically ' ~ cyc_now.on ~ ' min on / ' ~ cyc_now.off ~ ' min off (' ~ cyc_now.duty ~ '% duty), ' ~ src ~ '.' ~ (' This is the schedule the failsafe follows if the temperature sensor is lost.' if failsafe == 'learned' else ''))] -%}
+                {%- endif -%}
+
                 {#- ---------- 24h context ---------- -#}
                 {%- if avg_t is not none and avg_rh is not none -%}
                   {%- set ns.l = ns.l + [('averages', '' ~ (avg_t | round(1)) ~ '°C (' ~ ('%+.1f' | format(avg_t - target_t)) ~ ' from target) and ' ~ (avg_rh | round(0) | int) ~ '% RH (' ~ ('%+d' | format((avg_rh - target_h) | round(0) | int)) ~ ' from target). Live RH is ' ~ rh_live ~ '%, which swings with each compressor cycle and is why the 1h average is used for decisions.')] -%}
@@ -650,7 +924,7 @@ actions:
                 {{ dict(ns.l) }}
           - variables:
               explanation: >-
-                {%- set labels = {'temperature': 'Temperature', 'humidity': 'Humidity', 'decision': 'Decision', 'power': 'Power', 'supply': 'Supply', 'averages': '24h averages'} -%}
+                {%- set labels = {'temperature': 'Temperature', 'temp_1h': '1h temperature', 'humidity': 'Humidity', 'decision': 'Decision', 'power': 'Power', 'supply': 'Supply', 'cycle': 'Learned cycle', 'averages': '24h averages'} -%}
                 {%- for k, v in explanation_parts.items() -%}
                   {{ labels[k] }}: {{ v }}{{ '\n' if not loop.last else '' }}
                 {%- endfor -%}
@@ -694,6 +968,9 @@ actions:
                         explanation=explanation,
                         mode=chamber_type,
                         temp=t,
+                        temp_1h=t_1h,
+                        temp_stale=temp_stale,
+                        humidity_stale=hum_stale,
                         rh_1h=rh,
                         rh_live=rh_live,
                         setpoint=eff_target | round(2),
@@ -705,6 +982,11 @@ actions:
                         minutes_in_state=mins_since | round(1),
                         amps=amps,
                         volts=volts,
+                        learned_on_min=cyc_now.on if cyc_now is not none else none,
+                        learned_off_min=cyc_now.off if cyc_now is not none else none,
+                        learned_duty=cyc_now.duty if cyc_now is not none else none,
+                        learned_profile={'on': mem.on, 'off': mem.off, 'on_samples': mem.cn, 'off_samples': mem.cf},
+                        defrost_until=(mem.d | timestamp_local) if defrost_left > 0 else none,
                         updated=now().isoformat(),
                         mqtt_topic=mqtt_base) | tojson }}
 
@@ -719,6 +1001,17 @@ actions:
               avg_t: "{{ states(avg_temp_sensor) | float(none) }}"
               avg_rh: "{{ states(avg_humidity_sensor) | float(none) }}"
               pwr: "{{ 'ON' if is_state(power_switch, 'on') else 'OFF' }}"
+              t_1h: "{{ states(smoothed_temp_sensor) | float(none) if smoothed_temp_sensor != '' else none }}"
+              # History stats sensor: "ratio" is already %, "time" is hours in the last 24h
+              duty: >-
+                {%- set s = states[duty_sensor] if duty_sensor != '' else none -%}
+                {%- if s is none or not is_number(s.state) -%}{{ none }}
+                {%- elif s.attributes.unit_of_measurement == '%' -%}{{ s.state | float }}
+                {%- elif s.attributes.unit_of_measurement == 'h' -%}{{ (s.state | float / 24 * 100) | round(1) }}
+                {%- else -%}{{ none }}{%- endif -%}
+              stale_for: >-
+                {%- set s = states[temp_sensor if trigger.id == 'temp_stale' else humidity_sensor] -%}
+                {{ ((now() - s.last_reported).total_seconds() / 60) | round(0) | int if s is not none else 0 }}
               title: >-
                 {%- set titles = {
                   'temp_high': 'Curing chamber too warm',
@@ -730,13 +1023,15 @@ actions:
                   'low_voltage': 'Chamber low voltage',
                   'long_run': 'Chamber running continuously',
                   'sensor_lost': 'Chamber sensor offline',
+                  'temp_stale': 'Chamber temperature sensor stale',
+                  'hum_stale': 'Chamber humidity sensor stale',
                   'summary': 'Curing chamber daily summary'
                 } -%}
                 {{ titles.get(trigger.id, 'Curing chamber') }}
               message: >-
                 {%- set id = trigger.id -%}
                 {%- if id in ['temp_high', 'temp_low'] -%}
-                  {{ t_now }}°C (target {{ target_t }}°C). Power is {{ pwr }}, drawing {{ amps }} A.
+                  {{ t_now }}°C{% if t_1h is not none %}, 1h avg {{ t_1h | round(1) }}°C{% endif %} (target {{ target_t }}°C). Power is {{ pwr }}, drawing {{ amps }} A.
                   {%- if id == 'temp_high' %} Check the door seal and whether the compressor is running.{% endif -%}
                 {%- elif id == 'hum_high' -%}
                   1h avg RH {{ states(smoothed_humidity_sensor) }}% (target {{ target_h }}%). Try more airflow (a small fan), wiping condensation, or a desiccant.
@@ -752,9 +1047,20 @@ actions:
                   Power has been on continuously and the chamber is at {{ t_now }}°C (target {{ target_t }}°C). Check the door, the room temperature, and the compressor.
                 {%- elif id == 'sensor_lost' -%}
                   The temperature sensor has been unavailable for 10 minutes. Failsafe is set to "{{ failsafe }}".
+                  {%- if failsafe == 'learned' and cyc_now is not none %} Cycling on the learned schedule: {{ cyc_now.on | round(0) | int }} min on / {{ cyc_now.off | round(0) | int }} min off.
+                  {%- elif failsafe == 'learned' %} No cycle has been learned yet, so power is off.{% endif -%}
+                {%- elif id == 'temp_stale' -%}
+                  The temperature sensor still shows {{ t_now }}°C but last reported {{ stale_for }} min ago, so it is being ignored and failsafe "{{ failsafe }}" is in effect. Check its battery and signal.
+                  {%- if failsafe == 'learned' and cyc_now is not none %} Cycling on the learned schedule: {{ cyc_now.on | round(0) | int }} min on / {{ cyc_now.off | round(0) | int }} min off.
+                  {%- elif failsafe == 'learned' %} No cycle has been learned yet, so power is off.{% endif -%}
+                {%- elif id == 'hum_stale' -%}
+                  The humidity sensor still shows {{ rh_now }}% but last reported {{ stale_for }} min ago, so humidity assist is paused. Check its battery and signal.
                 {%- elif id == 'summary' -%}
                   24h avg: {% if avg_t is not none %}{{ avg_t | round(1) }}°C ({{ '%+.1f' | format(avg_t - target_t) }}){% else %}n/a{% endif %} / {% if avg_rh is not none %}{{ avg_rh | round(0) | int }}% ({{ '%+d' | format((avg_rh - target_h) | round(0) | int) }}){% else %}n/a{% endif %}.
                   Now: {{ t_now }}°C / {{ rh_now }}% · Power {{ pwr }} · {{ amps }} A @ {{ volts }} V.
+                  {%- if duty is not none %} Power was on {{ duty | round(0) | int }}% of the last 24h
+                  {%- if duty > duty_warn %}, which is high: check the door seal, the room temperature{{ ' and the coil for ice' if chamber_type == 'cooling' else '' }}.{% else %}.{% endif %}{% endif -%}
+                  {%- if cyc_now is not none %} Typical cycle at this time of day: {{ cyc_now.on | round(0) | int }} min on / {{ cyc_now.off | round(0) | int }} min off.{% endif -%}
                   {%- if avg_rh is not none and avg_rh < target_h - hum_band %} Humidity is running low, so add more water surface area.
                   {%- elif avg_rh is not none and avg_rh > target_h + hum_band %} Humidity is running high, so consider adding airflow.{% endif -%}
                 {%- endif -%}
