@@ -36,3 +36,14 @@ If nothing has been learned yet, it turns power off.
 A sensor counts as stale when it still shows a value but has not reported for the
 **Stale sensor timeout** (default 60 min). Clear the memory helper to relearn from
 scratch, for example after moving the chamber.
+
+## Dashboard
+
+`dashboard.yaml` is an example sections view for the controller. Paste it into a new
+dashboard's raw configuration editor and swap in your own entity IDs.
+
+It needs [apexcharts-card](https://github.com/RomRider/apexcharts-card) (HACS) and a
+recent Home Assistant release (heading cards and the tile card's trend graph). For the
+History time-range switch, create a **Dropdown** helper named `curing_chamber_range`
+(`input_select.curing_chamber_range`) with the options `3 hours`, `24 hours` and
+`30 days`. Without it, the 3-hour charts show.
